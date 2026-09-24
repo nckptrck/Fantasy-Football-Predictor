@@ -350,8 +350,15 @@ control_season, control_week = st.columns([1, 1])
 with control_season:
 	selected_season = st.selectbox("Season", seasons, index=0)
 available_weeks = sorted(initial_data.loc[initial_data["target_season"] == selected_season, "target_week"].unique())
+season_run_weeks = [
+	prediction_run_week(path)
+	for path in prediction_paths
+	if re.match(rf"production_predictions_{int(selected_season)}(?:_week_\d+)?\.csv$", path.name)
+]
+current_week = max(season_run_weeks, default=max(available_weeks))
+week_index = available_weeks.index(current_week) if current_week in available_weeks else len(available_weeks) - 1
 with control_week:
-	selected_week = st.selectbox("Week", available_weeks, index=0)
+	selected_week = st.selectbox("Week", available_weeks, index=week_index)
 st.caption("Forecasts load automatically from the saved season/week file.")
 
 selected_path = forecast_path_for(int(selected_season), int(selected_week))
