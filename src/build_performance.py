@@ -163,7 +163,10 @@ def main() -> None:
         f"predictions_with_actuals_{args.season}"
         f"_week_{args.week}.csv" if args.week is not None else f"predictions_with_actuals_{args.season}.csv"
     )
-    merge_actuals(args.predictions, args.data_dir, args.season).to_csv(updated_predictions, index=False)
+    updated_frame = merge_actuals(args.predictions, args.data_dir, args.season)
+    if args.week is not None:
+        updated_frame = updated_frame[updated_frame["target_week"].eq(args.week)]
+    updated_frame.to_csv(updated_predictions, index=False)
     print(f"Saved performance artifact to {output}")
     print(f"Saved predictions with actuals to {updated_predictions}")
     print(f"Scored {artifact['n_predictions']:,} prediction rows across weeks {artifact['weeks_scored']}")

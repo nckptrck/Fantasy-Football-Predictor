@@ -16,7 +16,6 @@ import yaml
 from joblib import dump
 
 from create_tensors import create_tensors, load_tables, load_tensors, save_tensors
-from build_performance import merge_actuals
 from evaluate_predictions import (
     combine_predictions,
     rmse_by_timedelta,
@@ -59,27 +58,30 @@ def refresh_data(config: dict[str, Any], end_season: int) -> Path:
     return data_dir
 
 
-def latest_labeled_season(tables: dict[str, pd.DataFrame]) -> int:
-    """Find the newest season with weekly player outcomes."""
-    weekly = tables["weekly"]
-    if "season_type" in weekly:
-        weekly = weekly[weekly["season_type"] == "REG"]
-    if weekly.empty:
-        raise ValueError("No labeled weekly outcomes were found")
-    return int(weekly["season"].max())
-
-
 def resolve_forecast_start_week(
     tables: dict[str, pd.DataFrame],
     forecast_season: int,
     requested_week: int | None,
     regular_season_end: int,
 ) -> int:
-    """Use the first week without current-season weekly outcomes as the forecast start."""
-    weekly = tables["weekly"]
-    season_weekly = weekly[weekly["season"].astype(int) == forecast_season]
-    latest_week = int(season_weekly["week"].max()) if not season_weekly.empty else 0
-    expected_week = min(latest_week + 1, regular_season_end)
+    """Use the first regular-season week whose scheduled games are not all final."""
+    schedules = tables["schedules"]
+    season_games = schedules[
+        (schedules["season"].astype(int) == forecast_season)
+        & schedules["game_type"].eq("REG")
+        & schedules["week"].between(1, regular_season_end)
+    ].copy()
+    if season_games.empty:
+        raise ValueError(f"No regular-season schedule rows found for {forecast_season}")
+    scores_final = (
+        pd.to_numeric(season_games["away_score"], errors="coerce").notna()
+        & pd.to_numeric(season_games["home_score"], errors="coerce").notna()
+    )
+    season_games["game_final"] = scores_final
+    week_status = season_games.groupby("week")["game_final"].all().sort_index()
+    incomplete_weeks = week_status.index[~week_status]
+    expected_week = int(incomplete_weeks[0]) if len(incomplete_weeks) else min(int(week_status.index.max()) + 1, regular_season_end)
+    latest_week = expected_week - 1
     start_week = expected_week if requested_week is None else int(requested_week)
     if not 1 <= start_week <= regular_season_end:
         raise ValueError(f"start week must be between 1 and {regular_season_end}")
@@ -89,6 +91,21 @@ def resolve_forecast_start_week(
             f"({expected_week}); latest available {forecast_season} weekly/PBP data is week {latest_week}."
         )
     return start_week
+
+
+def exclude_incomplete_week_stats(
+    tables: dict[str, pd.DataFrame], forecast_season: int, forecast_start_week: int
+) -> dict[str, pd.DataFrame]:
+    """Exclude all current-season outcomes from the forecast week onward."""
+    filtered_tables = dict(tables)
+    for table_name in ("weekly", "team_weekly_stats"):
+        frame = tables[table_name]
+        keep = ~(
+            frame["season"].astype(int).eq(forecast_season)
+            & frame["week"].astype(int).ge(forecast_start_week)
+        )
+        filtered_tables[table_name] = frame.loc[keep].copy()
+    return filtered_tables
 
 
 def _scale_with(scaler: Any, numeric_inputs: np.ndarray) -> np.ndarray:
@@ -274,18 +291,24 @@ def run_forecast(
         cache_dir / "training_tensors.npz",
         rebuild_tensors,
     )
-    labeled_season = min(forecast_season - 1, latest_labeled_season(tables))
-    train_indices = np.asarray([
-        index for index, sample in enumerate(training_tensors["metadata"])
-        if max(sample["target_seasons"]) <= labeled_season
-    ], dtype=int)
+    train_indices_list = []
+    for index, sample in enumerate(training_tensors["metadata"]):
+        target_seasons = np.asarray(sample["target_seasons"], dtype=int)
+        target_weeks = np.asarray(sample["target_weeks"], dtype=int)
+        played = training_tensors["target_played_mask"][index].astype(bool)
+        allowed_targets = (target_seasons < forecast_season) | (
+            (target_seasons == forecast_season) & (target_weeks < forecast_start_week)
+        )
+        if played.any() and np.all(allowed_targets[played]):
+            train_indices_list.append(index)
+    train_indices = np.asarray(train_indices_list, dtype=int)
     if not len(train_indices):
         raise ValueError("No labeled training windows are available")
     if tune:
         validation_seasons = [
             int(season)
             for season in config.get("evaluation", {}).get("validation_seasons", [])
-            if int(season) <= labeled_season
+            if int(season) < forecast_season
         ]
         if not validation_seasons:
             raise ValueError("Tuning requires configured validation seasons before the forecast season")
@@ -326,11 +349,8 @@ def run_forecast(
     forecast_rows.to_csv(output_path, index=False)
     model.save(output_path.with_suffix(".keras"))
     dump(scaler, output_path.with_name(f"{output_path.stem}_scaler.joblib"))
-    actuals_output = output_path.with_name(f"predictions_with_actuals_{forecast_season}.csv")
-    merge_actuals(output_path, data_dir, forecast_season).to_csv(actuals_output, index=False)
     print(f"Trained for {len(history)} epochs on {len(train_indices)} windows")
     print(f"Saved {len(forecast_rows)} forecast rows to {output_path}")
-    print(f"Saved available actuals to {actuals_output}")
 
 
 def main() -> None:
@@ -381,6 +401,7 @@ def main() -> None:
             int(config["data"]["regular_season_weeks"][1]),
         )
         print(f"[PIPELINE] Forecast start week: {forecast_start_week} (latest observed week: {forecast_start_week - 1})", flush=True)
+        tables = exclude_incomplete_week_stats(tables, forecast_season, forecast_start_week)
     default_output = (
         PROJECT_ROOT / "outputs" / "validation_predictions.csv"
         if args.mode == "evaluate"
