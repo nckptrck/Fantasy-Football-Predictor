@@ -326,8 +326,16 @@ if selected_view == "Model Performance":
 		selected_performance_season = st.selectbox("Performance season", performance_seasons)
 	season_path = performance_path_for(int(selected_performance_season), None)
 	season_artifact = json.loads(season_path.read_text()) if season_path else {"weeks_scored": []}
+	weekly_artifact_weeks = {
+		int(match.group(1))
+		for path in performance_paths
+		if (match := re.match(rf"performance_{int(selected_performance_season)}_week_(\d+)\.json$", path.name))
+	}
+	available_performance_weeks = sorted(
+		set(int(week) for week in season_artifact.get("weeks_scored", [])) | weekly_artifact_weeks
+	)
 	with performance_scope_col:
-		performance_scope = st.selectbox("Performance scope", ["Season"] + [f"Week {week}" for week in season_artifact.get("weeks_scored", [])])
+		performance_scope = st.selectbox("Performance scope", ["Season"] + [f"Week {week}" for week in available_performance_weeks])
 	selected_performance_week = None if performance_scope == "Season" else int(performance_scope.split()[-1])
 	selected_performance_path = performance_path_for(int(selected_performance_season), selected_performance_week)
 	if selected_performance_path is None:
